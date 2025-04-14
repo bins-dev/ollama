@@ -234,7 +234,7 @@ func TestHeadCount(t *testing.T) {
 	}
 
 	for _, tt := range cases {
-		got := tt.kv.HeadCount()
+		got := tt.kv.HeadCountMax()
 		if got != tt.want {
 			t.Errorf("unexpected max value: got=%d want=%d", got, tt.want)
 		}
