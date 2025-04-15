@@ -84,7 +84,12 @@ func (m *Model) EncodeMultimodal(ctx ml.Context, multimodalData []byte) (any, er
 		return nil, err
 	}
 
-	pixelValues, err := ctx.Input().FromFloatSlice(f32s, image.Bounds().Dx(), image.Bounds().Dy(), 3, 1)
+	// Calculate tensor dimensions
+	patchDim := m.ImageProcessor.numChannels * m.ImageProcessor.temporalPatchSize *
+		m.ImageProcessor.patchSize * m.ImageProcessor.patchSize
+	numPatches := gridT * gridH * gridW
+
+	pixelValues, err := ctx.Input().FromFloatSlice(f32s, patchDim, numPatches)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tensor from image: %w", err)
 	}
