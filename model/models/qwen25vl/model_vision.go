@@ -118,53 +118,49 @@ type PatchEmbedding struct {
 	PatchConv1 *nn.Conv2D `gguf:"patch_embd_1"`
 }
 
-// Forward computes patch embeddings for the vision model
 func (pe *PatchEmbedding) Forward(ctx ml.Context, pixelValues ml.Tensor, patchSize int) ml.Tensor {
 	shape := pixelValues.Shape()
-	fmt.Printf("Input tensor shape: %v\n", shape)
-
 	numChannels := 3
 	temporalPatchSize := 2
 	embedDim := 1280
-	numPatches := shape[1]
+	numPatches := shape[1] / temporalPatchSize
 
-	// Reshape to make the third dimension (index 2) equal to numChannels
-	reshaped := pixelValues.Reshape(ctx,
-		patchSize,                    // width
-		patchSize,                    // height
-		numChannels,                  // channels
-		numPatches*temporalPatchSize, // batch * temporal_dim
-	)
+	// Split the input tensor into two temporal slices and process each separately
+	// First temporal slice (frame 0)
+	slice0 := pixelValues.View(ctx, 0, patchSize*patchSize*numChannels, 0, numPatches, 0, 1).Contiguous(ctx)
+	reshaped0 := slice0.Reshape(ctx,
+		patchSize,   // height
+		patchSize,   // width
+		numChannels, // channels
+		numPatches)  // batch
 
-	// Apply convolutions with correct parameters
-	s0, s1 := patchSize, patchSize // stride
+	// Second temporal slice (frame 1)
+	slice1 := pixelValues.View(ctx, 0, patchSize*patchSize*numChannels, 0, numPatches, 1, 1).Contiguous(ctx)
+	reshaped1 := slice1.Reshape(ctx,
+		patchSize,   // height
+		patchSize,   // width
+		numChannels, // channels
+		numPatches)  // batch
+
+	// Apply the appropriate convolution to each temporal slice
+	// PatchConv0 corresponds to weights for temporal frame 0
+	// PatchConv1 corresponds to weights for temporal frame 1
+	s0, s1 := patchSize, patchSize // Use full stride as in original
 	p0, p1 := 0, 0                 // padding
 	d0, d1 := 1, 1                 // dilation
-	output1 := pe.PatchConv0.Forward(ctx, reshaped, s0, s1, p0, p1, d0, d1)
-	output2 := pe.PatchConv1.Forward(ctx, reshaped, s0, s1, p0, p1, d0, d1)
-	combined := output1.Add(ctx, output2)
 
-	// Reshape to separate the temporal dimension
-	reshaped1 := combined.Reshape(ctx,
-		embedDim,
-		numPatches,
-		temporalPatchSize,
-	)
+	output0 := pe.PatchConv0.Forward(ctx, reshaped0, s0, s1, p0, p1, d0, d1)
+	output1 := pe.PatchConv1.Forward(ctx, reshaped1, s0, s1, p0, p1, d0, d1)
 
-	// Now sum along the temporal dimension to reduce it from 2 to 1
-	slice0 := reshaped1.View(ctx, 0, embedDim, 0, numPatches, 0, 1).Contiguous(ctx)
-	slice1 := reshaped1.View(ctx, 0, embedDim, 0, numPatches, 1, 1).Contiguous(ctx)
-	finalSum := slice0.Add(ctx, slice1)
+	// Add the outputs from the two temporal convolutions
+	combined := output0.Add(ctx, output1)
 
-	finalOutput := finalSum.Reshape(ctx,
-		embedDim,
-		numPatches,
-	)
+	// Reshape to required output dimensions
+	result := combined.Reshape(ctx, embedDim, numPatches)
 
-	fmt.Printf("Final output shape: %v\n", finalOutput.Shape())
-	fmt.Println(ml.Dump(ctx, finalOutput))
+	fmt.Println(ml.Dump(ctx, result))
 
-	return finalOutput
+	return result
 }
 
 // VisionPatchMerger implements patch merging for the Qwen vision model
