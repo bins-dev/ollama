@@ -144,9 +144,6 @@ func (pe *PatchEmbedding) Forward(ctx ml.Context, pixelValues ml.Tensor, patchSi
 	output2 := pe.PatchConv1.Forward(ctx, reshaped, s0, s1, p0, p1, d0, d1)
 	combined := output1.Add(ctx, output2)
 
-	// Now we need to reshape to handle the temporal dimension properly
-	// The combined output is [1, 1, 1280, 704] where 704 = 352 * 2
-
 	// Reshape to separate the temporal dimension
 	reshaped1 := combined.Reshape(ctx,
 		embedDim,
