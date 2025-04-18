@@ -197,6 +197,8 @@ func (m *Model) parseToolCalls(s string) ([]api.ToolCall, bool) {
 		return nil, false
 	}
 
+	slog.Debug("parseToolCalls: template objects", "objects", templateObjects)
+
 	// find the keys that correspond to the name and arguments fields
 	var name, arguments string
 	for k, v := range templateObjects[0] {
@@ -266,104 +268,442 @@ func (m *Model) ParseToolCallsNew(s string) ([]api.ToolCall, bool) {
 
 	slog.Debug("parsing function calls", "input", s)
 
-	// Try JSON parsing first
-	if strings.HasPrefix(strings.TrimSpace(s), "[") {
-		// Try parsing as JSON array
+	// Trim whitespace from input
+	s = strings.TrimSpace(s)
+
+	// Try JSON array parsing first if input starts with [
+	if strings.HasPrefix(s, "[") {
 		var jsonArray []map[string]any
-		if err := json.Unmarshal([]byte(s), &jsonArray); err == nil {
-			var toolCalls []api.ToolCall
-			for _, obj := range jsonArray {
-				if calls, ok := parseJSONToolCalls(obj); ok {
-					toolCalls = append(toolCalls, calls...)
+		decoder := json.NewDecoder(strings.NewReader(s))
+		if err := decoder.Decode(&jsonArray); err == nil {
+			// Ensure there's no trailing content after the array
+			var dummy any
+			if !decoder.More() && decoder.Decode(&dummy) != nil {
+				var toolCalls []api.ToolCall
+				for _, obj := range jsonArray {
+					if calls, ok := parseJSONToolCalls(obj); ok {
+						toolCalls = append(toolCalls, calls...)
+					}
+				}
+
+				// Only return success if we found valid tool calls
+				if len(toolCalls) > 0 {
+					// Check if any of the tool calls are malformed
+					for _, call := range toolCalls {
+						if call.Function.Name == "" || len(call.Function.Arguments) == 0 {
+							return nil, false
+						}
+					}
+					return toolCalls, true
 				}
 			}
-			if len(toolCalls) > 0 {
-				return toolCalls, true
-			}
-		}
-	} else {
-		// Try parsing as single JSON object
-		var jsonObj map[string]any
-		if err := json.Unmarshal([]byte(s), &jsonObj); err == nil {
-			if toolCalls, ok := parseJSONToolCalls(jsonObj); ok {
-				return toolCalls, true
-			}
 		}
 	}
 
-	// Fall back to Python-style parsing
-	re := regexp.MustCompile(`(\w+)\((.*?)\)`)
-	matches := re.FindAllStringSubmatch(s, -1)
-
-	if len(matches) == 0 {
-		slog.Debug("no function calls found")
-		return nil, false
-	}
-
-	slog.Debug("found function calls", "matches", len(matches))
-
+	// Try parsing single objects and Python function calls
 	var toolCalls []api.ToolCall
-	for i, match := range matches {
-		name := match[1]
-		args := match[2]
+	for offset := 0; offset < len(s); {
+		// Try single object if not array
+		var jsonObj map[string]any
+		decoder := json.NewDecoder(strings.NewReader(s[offset:]))
+		if err := decoder.Decode(&jsonObj); err != nil {
+			// If we can't parse JSON, try Python function call
+			re := regexp.MustCompile(`(\w+)\((.*?)\)`)
+			if match := re.FindStringSubmatchIndex(s[offset:]); match != nil {
+				// Found a Python function call
+				name := s[offset+match[2] : offset+match[3]]
+				args := s[offset+match[4] : offset+match[5]]
 
-		slog.Debug("parsing function call", "index", i, "name", name, "args", args)
-
-		arguments := make(api.ToolCallFunctionArguments)
-
-		if strings.Contains(args, "=") { // Keyword args
-			pairs := strings.Split(args, ",")
-			for _, pair := range pairs {
-				pair = strings.TrimSpace(pair)
-				kv := strings.Split(pair, "=")
-				if len(kv) == 2 {
-					key := strings.TrimSpace(kv[0])
-					value := strings.TrimSpace(kv[1])
-					arguments[key] = value
+				arguments := make(api.ToolCallFunctionArguments)
+				if strings.Contains(args, "=") { // Keyword args
+					pairs := strings.SplitSeq(args, ",")
+					for pair := range pairs {
+						pair = strings.TrimSpace(pair)
+						kv := strings.Split(pair, "=")
+						if len(kv) == 2 {
+							key := strings.TrimSpace(kv[0])
+							value := strings.TrimSpace(kv[1])
+							arguments[key] = value
+						}
+					}
+					toolCalls = append(toolCalls, api.ToolCall{
+						Function: api.ToolCallFunction{
+							Name:      name,
+							Arguments: arguments,
+						},
+					})
 				}
+				// Skip past the function call
+				offset += match[1]
+			} else {
+				// No JSON or Python function call found, move forward
+				offset++
 			}
-		} else { // Positional args
-			arguments["args"] = args
+			continue
 		}
-
-		toolCalls = append(toolCalls, api.ToolCall{
-			Function: api.ToolCallFunction{
-				Name:      name,
-				Arguments: arguments,
-			},
-		})
+		// Successfully parsed object, process it
+		if calls, ok := parseJSONToolCalls(jsonObj); ok {
+			toolCalls = append(toolCalls, calls...)
+		}
+		offset += int(decoder.InputOffset())
 	}
 
-	slog.Debug("finished parsing", "tool_calls", len(toolCalls))
-	return toolCalls, len(toolCalls) > 0
-}
-
-func parseJSONToolCalls(obj map[string]any) ([]api.ToolCall, bool) {
-	// Check for function-style format first
-	if function, ok := obj["function"].(map[string]any); ok {
-		name, _ := function["name"].(string)
-		args, _ := function["arguments"].(map[string]any)
-		if name != "" && args != nil {
-			return []api.ToolCall{{
-				Function: api.ToolCallFunction{
-					Name:      name,
-					Arguments: args,
-				},
-			}}, true
+	// Only return success if we found valid tool calls and no errors
+	if len(toolCalls) > 0 {
+		// Check if any of the tool calls are malformed
+		for _, call := range toolCalls {
+			if call.Function.Name == "" || len(call.Function.Arguments) == 0 {
+				return nil, false
+			}
 		}
-	}
-
-	// Check for direct name/parameters format
-	if name, ok := obj["name"].(string); ok {
-		if params, ok := obj["parameters"].(map[string]any); ok {
-			return []api.ToolCall{{
-				Function: api.ToolCallFunction{
-					Name:      name,
-					Arguments: params,
-				},
-			}}, true
-		}
+		return toolCalls, true
 	}
 
 	return nil, false
+}
+
+// ToolCallFormat represents different possible formats for tool calls
+type toolCallFormat struct {
+	// Direct format
+	Name      string         `json:"name,omitempty"`
+	Arguments map[string]any `json:"arguments,omitempty"`
+
+	// Command-r-plus format
+	ToolName   string         `json:"tool_name,omitempty"`
+	Parameters map[string]any `json:"parameters,omitempty"`
+
+	// Function format
+	Function *struct {
+		Name       string         `json:"name"`
+		Arguments  map[string]any `json:"arguments,omitempty"`
+		Parameters map[string]any `json:"parameters,omitempty"`
+	} `json:"function,omitempty"`
+
+	// Xlam format
+	ToolCalls []toolCallFormat `json:"tool_calls,omitempty"`
+}
+
+func parseJSONToolCalls(obj map[string]any) ([]api.ToolCall, bool) {
+	// Helper to convert any to []any safely
+	toArray := func(v any) []any {
+		if arr, ok := v.([]any); ok {
+			return arr
+		}
+		return nil
+	}
+
+	// Convert a single format to a tool call
+	makeToolCall := func(f toolCallFormat) (api.ToolCall, bool) {
+		switch {
+		case f.Name != "" && f.Arguments != nil:
+			return api.ToolCall{
+				Function: api.ToolCallFunction{
+					Name:      f.Name,
+					Arguments: f.Arguments,
+				},
+			}, true
+		case f.ToolName != "" && f.Parameters != nil:
+			return api.ToolCall{
+				Function: api.ToolCallFunction{
+					Name:      f.ToolName,
+					Arguments: f.Parameters,
+				},
+			}, true
+		case f.Function != nil && f.Function.Name != "":
+			args := f.Function.Arguments
+			if args == nil {
+				args = f.Function.Parameters
+			}
+			if args != nil {
+				return api.ToolCall{
+					Function: api.ToolCallFunction{
+						Name:      f.Function.Name,
+						Arguments: args,
+					},
+				}, true
+			}
+		}
+		return api.ToolCall{}, false
+	}
+
+	// Try parsing as array first
+	if arr := toArray(obj); arr != nil {
+		var calls []api.ToolCall
+		for _, item := range arr {
+			if itemMap, ok := item.(map[string]any); ok {
+				var format toolCallFormat
+				data, _ := json.Marshal(itemMap)
+				if err := json.Unmarshal(data, &format); err == nil {
+					if call, ok := makeToolCall(format); ok {
+						calls = append(calls, call)
+					}
+				}
+			}
+		}
+		if len(calls) > 0 {
+			return calls, true
+		}
+	}
+
+	// Try parsing as single object
+	var format toolCallFormat
+	data, _ := json.Marshal(obj)
+	if err := json.Unmarshal(data, &format); err != nil {
+		return nil, false
+	}
+
+	// Handle xlam format (tool_calls array)
+	if len(format.ToolCalls) > 0 {
+		var calls []api.ToolCall
+		for _, f := range format.ToolCalls {
+			if call, ok := makeToolCall(f); ok {
+				calls = append(calls, call)
+			}
+		}
+		if len(calls) > 0 {
+			return calls, true
+		}
+	}
+
+	// Try as single tool call
+	if call, ok := makeToolCall(format); ok {
+		return []api.ToolCall{call}, true
+	}
+
+	return nil, false
+}
+
+func (m *Model) ParseToolCallsStream(s string) ([]api.ToolCall, bool, bool) {
+	fmt.Println("parsing tool calls", s)
+	// Try parsing single objects and Python function calls
+	var toolCalls []api.ToolCall
+	for offset := 0; offset < len(s); {
+		// Try single object if not array
+		var jsonObj map[string]any
+		decoder := json.NewDecoder(strings.NewReader(s[offset:]))
+		if err := decoder.Decode(&jsonObj); err != nil {
+			// If we can't parse JSON, try Python function call
+			re := regexp.MustCompile(`(\w+)\((.*?)\)`)
+			if match := re.FindStringSubmatchIndex(s[offset:]); match != nil {
+				// Found a Python function call
+				name := s[offset+match[2] : offset+match[3]]
+				args := s[offset+match[4] : offset+match[5]]
+				fmt.Println("matched python function call", name, args)
+
+				arguments := make(api.ToolCallFunctionArguments)
+				if strings.Contains(args, "=") { // Keyword args
+					pairs := strings.SplitSeq(args, ",")
+					for pair := range pairs {
+						pair = strings.TrimSpace(pair)
+						kv := strings.Split(pair, "=")
+						if len(kv) == 2 {
+							key := strings.TrimSpace(kv[0])
+							value := strings.TrimSpace(kv[1])
+							arguments[key] = value
+						}
+					}
+					toolCalls = append(toolCalls, api.ToolCall{
+						Function: api.ToolCallFunction{
+							Name:      name,
+							Arguments: arguments,
+						},
+					})
+				}
+				// Skip past the function call
+				offset += match[1]
+			} else {
+				// Try partial match if full match failed
+				fmt.Println("trying partial match", s[offset:])
+				rePartial := regexp.MustCompile(`(\w+)(?:\((.*?)(?:\)|$)|$)`)
+				if match := rePartial.FindStringSubmatchIndex(s[offset:]); match != nil {
+					fmt.Println("matched partial python function call", s)
+					return nil, true, true
+					// offset += match[1]
+				} else {
+					// No JSON, full Python or partial Python function call found, move forward
+					offset++
+				}
+			}
+			continue
+		}
+		// Successfully parsed object, process it
+		if calls, ok := parseJSONToolCalls(jsonObj); ok {
+			toolCalls = append(toolCalls, calls...)
+		}
+		offset += int(decoder.InputOffset())
+	}
+
+	// Only return success if we found valid tool calls and no errors
+	if len(toolCalls) > 0 {
+		// Check if any of the tool calls are malformed
+		for _, call := range toolCalls {
+			if call.Function.Name == "" || len(call.Function.Arguments) == 0 {
+				return nil, false, false
+			}
+		}
+		return toolCalls, false, true
+	}
+
+	return nil, false, false
+}
+
+func (m *Model) ParseToolCallsStreamNew(s string, prefix *string, specialToken *string) ([]api.ToolCall, bool, bool) {
+	// The prefix check for for the tags shouldn't really be used and we should be consuming this from the model
+	// Knowing what the tool token enables quicker and more reliable parsing
+	fmt.Println("parsing tool calls", s)
+	specialPrefixes := []string{"[", "<"}
+	specialToolTokensMap := map[string]map[string]string{
+		"<": {
+			"<function_call>": "</function_call>",
+			"<tool_call>":     "</tool_call>",
+			"<toolcall>":      "</toolcall>",
+		},
+		"[": {
+			"[TOOL_CALLS]": "",
+		},
+		"f":   {"functools": ""},
+		"```": {"```": ""},
+	}
+	var partial bool
+
+	s = strings.TrimSpace(s)
+
+	if len(s) == 0 {
+		return nil, false, false
+	}
+
+	if *prefix == "" {
+		if s[0] != '[' && s[0] != '<' {
+			return nil, false, false
+		}
+		fmt.Println("prefix is empty")
+		for _, pre := range specialPrefixes {
+			if strings.HasPrefix(s, pre) {
+				*prefix = pre
+				partial = true
+				fmt.Println("found special prefix", pre)
+				if *specialToken == "" {
+					for token := range specialToolTokensMap[pre] {
+						if strings.Contains(s, token) {
+							fmt.Println("found special tool token", token)
+							*specialToken = token
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+	} else {
+		partial = true
+		// Check for special token if we haven't found it yet
+		if *specialToken == "" {
+			fmt.Println("special token is empty")
+			for token := range specialToolTokensMap[*prefix] {
+				if strings.Contains(s, token) {
+					fmt.Println("found special tool token", token)
+					*specialToken = token
+					break
+				}
+			}
+		}
+	}
+
+	if !partial {
+		return nil, false, false
+	}
+	// Look for <function_call> tags
+	fmt.Println("looking for special token", *specialToken)
+	start := strings.Index(s, *specialToken)
+	if start == -1 {
+		if partial {
+			fmt.Println("found opening tag, partial match", *specialToken)
+			return nil, true, true
+		}
+		return nil, false, false
+	}
+	var end int
+	if specialToolTokensMap[*prefix][*specialToken] != "" {
+		end = strings.Index(s, specialToolTokensMap[*prefix][*specialToken])
+		if end == -1 {
+			fmt.Println("no closing tag found")
+			return nil, true, true // Partial match
+		}
+	} else {
+		end = len(s)
+	}
+
+	// Extract content between tags
+
+	var content string
+	content = s[start+len(*specialToken) : end]
+	content = strings.TrimSpace(content)
+	fmt.Println("content", content)
+
+	var toolCalls []api.ToolCall
+
+	// Try parsing as JSON first - could be single object or array
+	var jsonObj any
+	if err := json.Unmarshal([]byte(content), &jsonObj); err == nil {
+		// Try as single object
+		if obj, ok := jsonObj.(map[string]any); ok {
+			if calls, ok := parseJSONToolCalls(obj); ok {
+				toolCalls = append(toolCalls, calls...)
+			}
+		}
+		// Try as array of objects
+		if arr, ok := jsonObj.([]any); ok {
+			for _, item := range arr {
+				if obj, ok := item.(map[string]any); ok {
+					if calls, ok := parseJSONToolCalls(obj); ok {
+						toolCalls = append(toolCalls, calls...)
+					}
+				}
+			}
+		}
+	} else {
+		// Try parsing as Python function call
+		re := regexp.MustCompile(`(\w+)\((.*?)\)`)
+		if match := re.FindStringSubmatchIndex(content); match != nil {
+			name := content[match[2]:match[3]]
+			args := content[match[4]:match[5]]
+
+			arguments := make(api.ToolCallFunctionArguments)
+			if strings.Contains(args, "=") { // Keyword args
+				pairs := strings.SplitSeq(args, ",")
+				for pair := range pairs {
+					pair = strings.TrimSpace(pair)
+					kv := strings.Split(pair, "=")
+					if len(kv) == 2 {
+						key := strings.TrimSpace(kv[0])
+						value := strings.TrimSpace(kv[1])
+						arguments[key] = value
+					}
+				}
+				toolCalls = append(toolCalls, api.ToolCall{
+					Function: api.ToolCallFunction{
+						Name:      name,
+						Arguments: arguments,
+					},
+				})
+			}
+		}
+	}
+
+	// Only return success if we found valid tool calls and no errors
+	if len(toolCalls) > 0 {
+		// Check if any of the tool calls are malformed
+		for _, call := range toolCalls {
+			if call.Function.Name == "" || len(call.Function.Arguments) == 0 {
+				return nil, false, false
+			}
+		}
+		return toolCalls, false, true
+	}
+
+	fmt.Println("no tool calls found, partial match", partial)
+	if partial {
+		return nil, true, true
+	}
+	return nil, false, false
 }
