@@ -125,7 +125,12 @@ func (kv KV) UintOrArrayValue(key string, defaultValue uint32) (uint32, uint32) 
 	if v, ok := keyValueUntyped(kv, key); ok {
 		switch v := v.(type) {
 		case *array:
-			if v.size == 0 {
+			length := len(v.values)
+			if length < v.size {
+				slog.Warn("trying to access a partially collected array. You probably want the whole array to be collected.", "key", key, "size", v.size, "len(values)", length)
+			}
+
+			if length == 0 {
 				return defaultValue, defaultValue
 			}
 			max := v.values[0].(int32)
